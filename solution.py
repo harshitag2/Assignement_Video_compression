@@ -33,6 +33,7 @@ OUTPUT_CRF             = 28     # ffmpeg quality: lower = better quality + large
 CALIBRATION_WINDOW_SEC = 30     # bonus: estimate motion discard threshold from first N seconds
 MOTION_DISCARD_MIN     = 0.02
 MOTION_DISCARD_MAX     = 0.12
+PROGRESS_EVERY_FRAMES  = 300
 
 ACTIVE_MOTION_DISCARD_THRESH = MOTION_DISCARD_THRESH
 
@@ -546,6 +547,15 @@ if __name__ == "__main__":
 
         prev_frame = frame
         frame_idx += 1
+
+        if frame_idx % PROGRESS_EVERY_FRAMES == 0 or frame_idx == total:
+            pct = (100.0 * frame_idx / total) if total else 0.0
+            elapsed = time.time() - t_start
+            print(
+                f"Progress: {frame_idx}/{total} ({pct:.1f}%) | "
+                f"kept={len(kept_frames)} | elapsed={elapsed:.1f}s",
+                flush=True,
+            )
 
     if cur_seg:
         segments.append(cur_seg)
