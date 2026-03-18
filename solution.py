@@ -30,6 +30,11 @@ MOTION_DISCARD_THRESH  = 0.05   # definitely discard below this
 CONTEXT_EVERY_SEC      = 3      # force-keep one frame every this many seconds
 OUTPUT_FPS             = 12     # frame rate of the output video
 OUTPUT_CRF             = 28     # ffmpeg quality: lower = better quality + larger file
+CALIBRATION_WINDOW_SEC = 30     # bonus: estimate motion discard threshold from first N seconds
+MOTION_DISCARD_MIN     = 0.02
+MOTION_DISCARD_MAX     = 0.12
+
+ACTIVE_MOTION_DISCARD_THRESH = MOTION_DISCARD_THRESH
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +137,47 @@ def has_face(frame: np.ndarray, cascade) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# MOTION THRESHOLD CALIBRATION
+# ---------------------------------------------------------------------------
+
+def auto_calibrate_motion_threshold(video_path: Path, fps_hint: float,
+                                    window_sec: int = CALIBRATION_WINDOW_SEC) -> float:
+    """
+    Estimate a robust low-motion discard threshold from the first window_sec of the video.
+    Uses quantiles of optical-flow magnitudes and clamps to a safe operational range.
+    """
+    calib_cap = cv2.VideoCapture(str(video_path))
+    if not calib_cap.isOpened():
+        return MOTION_DISCARD_THRESH
+
+    max_frames = max(2, int((fps_hint or 25.0) * window_sec))
+    motion_scores = []
+    prev_gray = None
+    seen = 0
+
+    while seen < max_frames:
+        ret, frame = calib_cap.read()
+        if not ret:
+            break
+
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        score = compute_motion_score(prev_gray, curr_gray)
+        if prev_gray is not None:
+            motion_scores.append(score)
+        prev_gray = curr_gray
+        seen += 1
+
+    calib_cap.release()
+
+    if len(motion_scores) < 20:
+        return MOTION_DISCARD_THRESH
+
+    p20, p35, p50 = np.percentile(motion_scores, [20, 35, 50])
+    adaptive = float((0.50 * p20) + (0.30 * p35) + (0.20 * p50))
+    return float(np.clip(adaptive, MOTION_DISCARD_MIN, MOTION_DISCARD_MAX))
+
+
+# ---------------------------------------------------------------------------
 # FRAME KEEP DECISION
 # ---------------------------------------------------------------------------
 
@@ -160,7 +206,7 @@ def should_keep_frame(frame: np.ndarray,
     curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY) if prev_frame is not None else None
     motion_score = compute_motion_score(prev_gray, curr_gray)
-    low_motion = motion_score < MOTION_DISCARD_THRESH
+    low_motion = motion_score < ACTIVE_MOTION_DISCARD_THRESH
 
     face_found = has_face(frame, cascade)
     if face_found:
@@ -387,6 +433,7 @@ def generate_compression_report(segments: list, stats: dict, output_path: Path):
         <div class="stat"><div class="k">Original Size</div><div class="v">{stats.get("original_size_mb", 0)} MB</div></div>
         <div class="stat"><div class="k">Compressed Size</div><div class="v">{stats.get("compressed_size_mb", 0)} MB</div></div>
         <div class="stat"><div class="k">Reduction</div><div class="v">{stats.get("reduction_pct", 0)}%</div></div>
+        <div class="stat"><div class="k">Motion Discard Threshold</div><div class="v">{ACTIVE_MOTION_DISCARD_THRESH:.3f}</div></div>
         <div class="stat"><div class="k">Processing Time</div><div class="v">{stats.get("processing_time_sec", 0)} s</div></div>
         <div class="stat"><div class="k">Original Duration</div><div class="v">{stats.get("original_duration_sec", 0)} s</div></div>
         <div class="stat"><div class="k">Compressed Duration</div><div class="v">{stats.get("compressed_duration_sec", 0)} s</div></div>
@@ -437,6 +484,11 @@ if __name__ == "__main__":
     orig_mb      = VIDEO_IN.stat().st_size / 1_000_000
 
     print(f"Input: {VIDEO_IN}  |  {total} frames  |  {duration:.1f}s  |  {orig_mb:.1f} MB")
+    ACTIVE_MOTION_DISCARD_THRESH = auto_calibrate_motion_threshold(VIDEO_IN, fps_in)
+    print(
+        f"Calibrated motion discard threshold: {ACTIVE_MOTION_DISCARD_THRESH:.3f} "
+        f"(from first {CALIBRATION_WINDOW_SEC}s)"
+    )
 
     kept_frames = []
     segments    = []
