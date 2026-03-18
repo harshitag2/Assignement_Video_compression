@@ -34,6 +34,9 @@ CALIBRATION_WINDOW_SEC = 30     # bonus: estimate motion discard threshold from 
 MOTION_DISCARD_MIN     = 0.02
 MOTION_DISCARD_MAX     = 0.12
 PROGRESS_EVERY_FRAMES  = 300
+MOTION_ANALYSIS_WIDTH  = 160
+FACE_ANALYSIS_WIDTH    = 160
+PREPROCESS_GRAY_WIDTH  = 160
 
 ACTIVE_MOTION_DISCARD_THRESH = MOTION_DISCARD_THRESH
 
@@ -42,22 +45,30 @@ ACTIVE_MOTION_DISCARD_THRESH = MOTION_DISCARD_THRESH
 # PERCEPTUAL HASH
 # ---------------------------------------------------------------------------
 
-def compute_phash(frame: np.ndarray) -> str:
+def compute_phash(frame: np.ndarray) -> int:
     """
     Compute a perceptual hash of the frame.
     Steps: resize to 32×32 grayscale → DCT → threshold at mean → flatten to bit string.
-    Return a string of '0' and '1' characters, length 64.
+    Return a 64-bit integer hash.
 
     You can use the imagehash library (imagehash.phash) or implement manually.
     TODO: implement
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if frame.ndim == 2:
+        gray = frame
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
     dct = cv2.dct(resized)
     low_freq = dct[:8, :8]
     thresh = float(np.mean(low_freq))
     bits = (low_freq > thresh).astype(np.uint8).flatten()
-    return "".join("1" if b else "0" for b in bits)
+
+    # Fast 64-bit packed representation for cheap Hamming distance.
+    h = 0
+    for b in bits:
+        h = (h << 1) | int(b)
+    return h
 
 
 def phash_similarity(h1: str, h2: str) -> float:
@@ -66,10 +77,18 @@ def phash_similarity(h1: str, h2: str) -> float:
     Formula: 1.0 - (hamming_distance / length)
     TODO: implement
     """
-    if not h1 or not h2 or len(h1) != len(h2):
+    if h1 is None or h2 is None:
         return 0.0
-    hamming_distance = sum(ch1 != ch2 for ch1, ch2 in zip(h1, h2))
-    return 1.0 - (hamming_distance / len(h1))
+
+    if isinstance(h1, int) and isinstance(h2, int):
+        hamming_distance = (h1 ^ h2).bit_count()
+        return 1.0 - (hamming_distance / 64.0)
+
+    if isinstance(h1, str) and isinstance(h2, str) and len(h1) == len(h2):
+        hamming_distance = sum(ch1 != ch2 for ch1, ch2 in zip(h1, h2))
+        return 1.0 - (hamming_distance / len(h1))
+
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +104,14 @@ def compute_motion_score(prev_gray, curr_gray: np.ndarray) -> float:
     """
     if prev_gray is None:
         return 0.0
+    if curr_gray.ndim == 3:
+        curr_gray = cv2.cvtColor(curr_gray, cv2.COLOR_BGR2GRAY)
+    if prev_gray.ndim == 3:
+        prev_gray = cv2.cvtColor(prev_gray, cv2.COLOR_BGR2GRAY)
     # Downsample for speed; motion thresholds remain stable on reduced grayscale.
-    if curr_gray.shape[1] > 320:
-        scale = 320.0 / curr_gray.shape[1]
-        new_size = (320, max(1, int(curr_gray.shape[0] * scale)))
+    if curr_gray.shape[1] > MOTION_ANALYSIS_WIDTH:
+        scale = MOTION_ANALYSIS_WIDTH / curr_gray.shape[1]
+        new_size = (MOTION_ANALYSIS_WIDTH, max(1, int(curr_gray.shape[0] * scale)))
         prev_proc = cv2.resize(prev_gray, new_size, interpolation=cv2.INTER_AREA)
         curr_proc = cv2.resize(curr_gray, new_size, interpolation=cv2.INTER_AREA)
     else:
@@ -121,11 +144,14 @@ def has_face(frame: np.ndarray, cascade) -> bool:
     Equalise histogram on grayscale first for better CCTV detection.
     TODO: cascade.detectMultiScale — scaleFactor=1.1, minNeighbors=3, minSize=(20,20)
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if frame.ndim == 2:
+        gray = frame
+    else:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray_eq = cv2.equalizeHist(gray)
-    if gray_eq.shape[1] > 360:
-        scale = 360.0 / gray_eq.shape[1]
-        new_size = (360, max(1, int(gray_eq.shape[0] * scale)))
+    if gray_eq.shape[1] > FACE_ANALYSIS_WIDTH:
+        scale = FACE_ANALYSIS_WIDTH / gray_eq.shape[1]
+        new_size = (FACE_ANALYSIS_WIDTH, max(1, int(gray_eq.shape[0] * scale)))
         gray_eq = cv2.resize(gray_eq, new_size, interpolation=cv2.INTER_AREA)
 
     faces = cascade.detectMultiScale(
@@ -162,6 +188,10 @@ def auto_calibrate_motion_threshold(video_path: Path, fps_hint: float,
             break
 
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if curr_gray.shape[1] > PREPROCESS_GRAY_WIDTH:
+            scale = PREPROCESS_GRAY_WIDTH / curr_gray.shape[1]
+            new_size = (PREPROCESS_GRAY_WIDTH, max(1, int(curr_gray.shape[0] * scale)))
+            curr_gray = cv2.resize(curr_gray, new_size, interpolation=cv2.INTER_AREA)
         score = compute_motion_score(prev_gray, curr_gray)
         if prev_gray is not None:
             motion_scores.append(score)
@@ -184,7 +214,7 @@ def auto_calibrate_motion_threshold(video_path: Path, fps_hint: float,
 
 def should_keep_frame(frame: np.ndarray,
                       prev_frame,
-                      prev_kept_hash: str,
+                      prev_kept_hash,
                       last_kept_time_sec: float,
                       current_time_sec: float,
                       cascade) -> tuple:
@@ -200,16 +230,19 @@ def should_keep_frame(frame: np.ndarray,
     """
     curr_hash = compute_phash(frame)
     duplicate_candidate = False
-    if prev_kept_hash:
+    if prev_kept_hash is not None:
         sim = phash_similarity(prev_kept_hash, curr_hash)
         duplicate_candidate = sim > PHASH_THRESHOLD
 
-    curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY) if prev_frame is not None else None
+    curr_gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if prev_frame is None:
+        prev_gray = None
+    else:
+        prev_gray = prev_frame if prev_frame.ndim == 2 else cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     motion_score = compute_motion_score(prev_gray, curr_gray)
     low_motion = motion_score < ACTIVE_MOTION_DISCARD_THRESH
 
-    face_found = has_face(frame, cascade)
+    face_found = has_face(curr_gray, cascade)
     if face_found:
         if motion_score > MOTION_KEEP_THRESH:
             return True, "face_and_motion", motion_score, True
@@ -493,8 +526,8 @@ if __name__ == "__main__":
 
     kept_frames = []
     segments    = []
-    prev_frame  = None
-    prev_hash   = ""
+    prev_gray   = None
+    prev_hash   = None
     last_kept_t = -999.0
     cur_seg     = None
     disc_dup    = 0
@@ -506,14 +539,19 @@ if __name__ == "__main__":
         if not ret:
             break
         ts = frame_idx / fps_in
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if gray.shape[1] > PREPROCESS_GRAY_WIDTH:
+            scale = PREPROCESS_GRAY_WIDTH / gray.shape[1]
+            new_size = (PREPROCESS_GRAY_WIDTH, max(1, int(gray.shape[0] * scale)))
+            gray = cv2.resize(gray, new_size, interpolation=cv2.INTER_AREA)
 
         keep, reason, motion, face = should_keep_frame(
-            frame, prev_frame, prev_hash, last_kept_t, ts, cascade
+            gray, prev_gray, prev_hash, last_kept_t, ts, cascade
         )
 
         if keep:
             kept_frames.append(frame.copy())
-            prev_hash   = compute_phash(frame)
+            prev_hash   = compute_phash(gray)
             last_kept_t = ts
 
             if cur_seg is None or (ts - cur_seg["end_sec"]) > 2.5:
@@ -545,7 +583,7 @@ if __name__ == "__main__":
             else:
                 disc_stat += 1
 
-        prev_frame = frame
+        prev_gray = gray
         frame_idx += 1
 
         if frame_idx % PROGRESS_EVERY_FRAMES == 0 or frame_idx == total:
